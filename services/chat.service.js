@@ -293,6 +293,7 @@ const legalChat = async ({
   userId,
   hasValidDocuments,
   irrelevantDocuments = [],
+  userMessageProvided = true,
 }) => {
   try {
     console.log(`Processing legal query: "${userInput}"`);
@@ -303,7 +304,7 @@ const legalChat = async ({
       );
 
     if (
-      hasCurrentDocumentReferences &&
+      (hasCurrentDocumentReferences || !userMessageProvided) &&
       irrelevantDocuments.length > 0 &&
       !hasValidDocuments
     ) {
@@ -352,8 +353,10 @@ Or feel free to ask me any questions about UK law.`;
     );
 
     // *** NEW: Check if query is about uploaded documents ***
+    // Files attached to this very message are always what the user is asking about
     const isDocumentQuery =
-      hasDocuments && isQueryAboutDocuments(userInput, uploadedDocuments);
+      hasDocuments &&
+      (hasValidDocuments || isQueryAboutDocuments(userInput, uploadedDocuments));
 
     if (isDocumentQuery) {
       console.log(

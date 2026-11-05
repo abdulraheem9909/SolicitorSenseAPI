@@ -943,4 +943,6 @@ module.exports = {
   createDocumentContext,
   isQueryAboutDocuments,
   extractTextFromFile,
+  isUKLegalDocument,
+  findRelevantDocuments,
 };

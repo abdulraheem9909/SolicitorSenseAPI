@@ -38,10 +38,30 @@ const upload = multer({
     }
   },
 });
+
+// Multer rejects bad uploads before the route handler runs, so its errors
+// must be converted here; the frontend toasts `error`.
+const uploadDocuments = (req, res, next) => {
+  upload.array("documents", 5)(req, res, (err) => {
+    if (!err) return next();
+
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ error: "Files must be under 10MB each" });
+    }
+    if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({ error: "Maximum 5 files per request" });
+    }
+    if (err.message?.includes("Unsupported file type")) {
+      return res.status(400).json({ error: err.message });
+    }
+    next(err);
+  });
+};
+
 router.post(
   "/",
   authenticateToken,
-  upload.array("documents", 5),
+  uploadDocuments,
   async (req, res) => {
     let pastMessages = [];
     let chat = [];
@@ -195,6 +215,7 @@ router.post(
         userId,
         hasValidDocuments,
         irrelevantDocuments,
+        userMessageProvided: !!msg?.trim(),
       });
 
       // *** SAVE MESSAGES TO DATABASE ***
@@ -257,28 +278,6 @@ router.post(
       res.status(201).json(responseData);
     } catch (err) {
       console.error("Chat route error:", err);
-
-      if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(400).json({
-          error: "File too large",
-          message: "Files must be under 10MB each",
-        });
-      }
-
-      if (err.code === "LIMIT_FILE_COUNT") {
-        return res.status(400).json({
-          error: "Too many files",
-          message: "Maximum 5 files per request",
-        });
-      }
-
-      if (err.message.includes("Unsupported file type")) {
-        return res.status(400).json({
-          error: "Unsupported file type",
-          message: err.message,
-        });
-      }
-
       res.status(500).json({ error: "Internal server error: " + err.message });
     }
   }
@@ -320,7 +319,7 @@ router.delete("/documents/:documentId", authenticateToken, async (req, res) => {
     const { documentId } = req.params;
     const userId = req.user?.id;
 
-    const UploadedDocument = require("../models/uploadedDocument");
+    const UploadedDocument = require("../models/uploadDocument");
     const document = await UploadedDocument.findOneAndUpdate(
       { _id: documentId, userId },
       { isActive: false },
@@ -373,7 +372,7 @@ router.get("/list", authenticateToken, async (req, res) => {
     if (sessionIds.length > 0) {
       const messages = await Message.aggregate([
         {
-          $match: { sessionId: { $in: sessionIds } },
+          $match: { userId, sessionId: { $in: sessionIds } },
         },
         {
           $sort: { sessionId: 1, createdAt: 1 },
@@ -394,18 +393,19 @@ router.get("/list", authenticateToken, async (req, res) => {
 
       res.status(200).json(messages);
     } else {
-      res
-        .status(404)
-        .json({ error: "No sessions found for the provided userId" });
+      res.status(200).json([]);
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.get("/:id", async (req, res) => {
+router.get("/:id", authenticateToken, async (req, res) => {
   try {
-    const message = await Message.findById(req.params.id);
+    const message = await Message.findOne({
+      _id: req.params.id,
+      userId: req.user?.id,
+    });
     if (!message) {
       return res.status(404).json({ error: "Message not found" });
     }
@@ -415,9 +415,12 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", authenticateToken, async (req, res) => {
   try {
-    const deletedMessage = await Message.findByIdAndDelete(req.params.id);
+    const deletedMessage = await Message.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user?.id,
+    });
     if (!deletedMessage) {
       return res.status(404).json({ error: "Message not found" });
     }

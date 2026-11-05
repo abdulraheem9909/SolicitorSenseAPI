@@ -34,7 +34,7 @@ router.post("/google-auth", async (req, res) => {
     const response = await authService.googleLogin(req.body);
     res.json(response);
   } catch (err) {
-    res.status(400).json({ err });
+    res.status(400).json({ error: err.message });
   }
 });
 
