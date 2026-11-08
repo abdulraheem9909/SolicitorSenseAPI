@@ -4,6 +4,7 @@ const cors = require("cors");
 const parseXML = require("./routes/lawData.routes");
 const authRoutes = require("./routes/auth.routes");
 const messageRoutes = require("./routes/chat.routes");
+const requireAdminKey = require("./middlewares/requireAdminKey");
 
 const app = express();
 app.use(express.json());
@@ -15,7 +16,7 @@ app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (req, res) => {
   res.send("Successful response.");
 });
-app.use("/api/parseXML", parseXML);
+app.use("/api/parseXML", requireAdminKey, parseXML);
 app.use('/api/auth', authRoutes);
 app.use("/api/chat", messageRoutes)
 

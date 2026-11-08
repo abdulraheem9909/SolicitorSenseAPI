@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "build:knowledge": "node scripts/buildKnowledgeBase.js"
   },
   "repository": {
     "type": "git",
