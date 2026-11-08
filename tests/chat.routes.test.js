@@ -13,7 +13,11 @@ jest.mock("../services/chat.service", () => ({
 // document.service asks GPT-4o for a summary of each upload
 jest.mock("@langchain/openai", () => ({
   ChatOpenAI: jest.fn(() => ({ invoke: jest.fn(async () => ({ content: "Mocked summary" })) })),
-  OpenAIEmbeddings: jest.fn(() => ({})),
+  OpenAIEmbeddings: jest.fn(() => ({
+    // chunk i points at [i, 1, 0]; the question points at chunk 38
+    embedDocuments: jest.fn(async (texts) => texts.map((_, i) => [i, 1, 0])),
+    embedQuery: jest.fn(async () => [38, 1, 0]),
+  })),
 }));
 const { legalChat } = require("../services/chat.service");
 
@@ -97,6 +101,36 @@ describe("POST /api/chat", () => {
     const docs = await UploadedDocument.find({ sessionId: res.body.sessionId });
     expect(docs).toHaveLength(1);
     expect(docs[0]).toMatchObject({ originalFilename: "contract.txt", summary: "Mocked summary" });
+  });
+
+  it("stores embedded chunks for a long document (#7)", async () => {
+    const longContract = Array.from({ length: 40 }, (_, i) => `${i + 1}. Clause ${i + 1}: ${UK_CONTRACT}`).join("\n\n");
+    expect(longContract.length).toBeGreaterThan(20000);
+
+    const res = await sendMessage(user.token, { files: [["long_contract.txt", longContract]] });
+
+    expect(res.status).toBe(201);
+    const [stored] = await UploadedDocument.find({ sessionId: res.body.sessionId });
+    expect(stored.chunks.length).toBeGreaterThan(20);
+    expect(stored.chunks.every((c) => c.text.length <= 1000 && c.embedding.length === 3)).toBe(true);
+  });
+
+  it("retrieves the relevant sections of a long document loaded back from MongoDB (#7)", async () => {
+    const { getSessionDocuments, createDocumentContext } = jest.requireActual("../services/document.service");
+    const longContract = Array.from({ length: 40 }, (_, i) => `${i + 1}. Clause ${i + 1}: ${UK_CONTRACT}`).join("\n\n");
+    const res = await sendMessage(user.token, { files: [["long_contract.txt", longContract]] });
+
+    const docs = await getSessionDocuments(res.body.sessionId, user.id || (await require("../models/user").findOne({ email: user.email }))._id.toString());
+    const context = await createDocumentContext(docs, "Is the notice clause lawful?", 2000);
+
+    expect(context).toContain("(most relevant sections)");
+    expect(context).not.toContain("(partial)");
+  });
+
+  it("stores no chunks for a short document", async () => {
+    const res = await sendMessage(user.token, { files: [["contract.txt", UK_CONTRACT]] });
+    const [stored] = await UploadedDocument.find({ sessionId: res.body.sessionId });
+    expect(stored.chunks).toEqual([]);
   });
 
   it("flags a non-legal document as irrelevant without storing it", async () => {
@@ -230,6 +264,55 @@ describe("chat history and sessions", () => {
     const own = await request(app).delete(`/api/chat/${id}`).set(auth(alice.token));
     expect(own.status).toBe(200);
     expect(await Message.exists({ _id: id })).toBeNull();
+  });
+
+  it("DELETE /api/chat/:id removes a question together with its answer (#20)", async () => {
+    const second = (await sendMessage(alice.token, { msg: "Second", sessionId: aliceSession.sessionId })).body;
+
+    const res = await request(app).delete(`/api/chat/${second.userMessage._id}`).set(auth(alice.token));
+
+    expect(res.status).toBe(200);
+    expect(res.body.deletedCount).toBe(2);
+    const left = await Message.find({ sessionId: aliceSession.sessionId }).sort({ createdAt: 1 });
+    expect(left.map((m) => m.msg)).toEqual(["Alice's question", "Mocked legal answer"]);
+  });
+
+  it("DELETE /api/chat/:id on an answer also removes its question (#20)", async () => {
+    const res = await request(app).delete(`/api/chat/${aliceSession.aiMessage._id}`).set(auth(alice.token));
+    expect(res.body.deletedCount).toBe(2);
+    expect(await Message.countDocuments({ sessionId: aliceSession.sessionId })).toBe(0);
+  });
+
+  it("DELETE /api/chat/session/:sessionId deletes the whole chat and its documents (#20)", async () => {
+    const withDoc = (await sendMessage(alice.token, { files: [["contract.txt", UK_CONTRACT]] })).body;
+    await sendMessage(alice.token, { msg: "Follow-up", sessionId: withDoc.sessionId });
+    const bobSession = (await sendMessage(bob.token, { msg: "Bob's question" })).body;
+
+    const other = await request(app).delete(`/api/chat/session/${withDoc.sessionId}`).set(auth(bob.token));
+    expect(other.status).toBe(404);
+
+    const res = await request(app).delete(`/api/chat/session/${withDoc.sessionId}`).set(auth(alice.token));
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ deletedMessages: 4, deletedDocuments: 1 });
+    expect(await Message.countDocuments({ sessionId: withDoc.sessionId })).toBe(0);
+    expect(await UploadedDocument.countDocuments({ sessionId: withDoc.sessionId })).toBe(0);
+
+    // other chats are untouched
+    expect(await Message.countDocuments({ sessionId: aliceSession.sessionId })).toBe(2);
+    expect(await Message.countDocuments({ sessionId: bobSession.sessionId })).toBe(2);
+  });
+});
+
+describe("response fields (#17, #18)", () => {
+  it("passes the service's document fields through unchanged", async () => {
+    const user = await createUser();
+    legalChat.mockResolvedValueOnce({
+      text: "Answer", sources: [], documentContext: false, sessionHasDocuments: true, documentsAvailable: 1,
+    });
+
+    const res = await sendMessage(user.token, { msg: "Is the cake recipe legal?" });
+
+    expect(res.body).toMatchObject({ documentContext: false, sessionHasDocuments: true, documentsAvailable: 1 });
   });
 });
 

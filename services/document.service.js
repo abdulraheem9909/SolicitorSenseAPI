@@ -1,7 +1,6 @@
 const mammoth = require("mammoth");
 const pdf = require("pdf-parse");
-const { ChatOpenAI } = require("@langchain/openai");
-const { OpenAIEmbeddings } = require("@langchain/openai");
+const { ChatOpenAI, OpenAIEmbeddings } = require("@langchain/openai");
 const UploadedDocument = require("../models/uploadDocument");
 
 const llm = new ChatOpenAI({
@@ -14,6 +13,94 @@ const embeddings = new OpenAIEmbeddings({
   apiKey: process.env.OPENAI_API_KEY,
   modelName: "text-embedding-3-small",
 });
+
+// Documents up to this length go into the prompt whole. Longer ones are split into
+// chunks that are embedded once at upload and stored with the document in MongoDB
+// (so they expire with it after 24 hours); questions then pull the matching chunks.
+const WHOLE_DOCUMENT_CHARS = 20000;
+const CHUNK_CHARS = 1000;
+const MAX_EMBEDDED_CHUNKS = 400; // keeps a stored document well under MongoDB's 16 MB limit
+
+// Fill a line up to `size` characters with whole words
+function wrapWords(text, size) {
+  const lines = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    if (line && line.length + 1 + word.length > size) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = line ? `${line} ${word}` : word;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Split text into chunks of at most `size` characters, keeping paragraphs together
+function splitIntoChunks(text, size = CHUNK_CHARS) {
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  let current = "";
+  for (const paragraph of paragraphs) {
+    const pieces = paragraph.length <= size ? [paragraph] : wrapWords(paragraph, size);
+    for (const piece of pieces) {
+      if (current && current.length + 1 + piece.length > size) {
+        chunks.push(current);
+        current = piece;
+      } else {
+        current = current ? `${current} ${piece}` : piece;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+// [] for documents short enough to send whole; otherwise [{ text, embedding }]
+async function embedDocumentChunks(text) {
+  if (text.length <= WHOLE_DOCUMENT_CHARS) return [];
+
+  const chunks = splitIntoChunks(text).slice(0, MAX_EMBEDDED_CHUNKS);
+  const vectors = await embeddings.embedDocuments(chunks);
+  return chunks.map((chunkText, i) => ({ text: chunkText, embedding: vectors[i] }));
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return normA && normB ? dot / Math.sqrt(normA * normB) : 0;
+}
+
+// The chunks closest in meaning to the question that fit in maxChars, in document order
+function pickRelevantChunks(chunks, queryVector, maxChars) {
+  const ranked = chunks
+    .map((chunk, index) => ({ ...chunk, index, score: cosineSimilarity(chunk.embedding, queryVector) }))
+    .sort((a, b) => b.score - a.score);
+
+  const picked = [];
+  let used = 0;
+  for (const chunk of ranked) {
+    if (used + chunk.text.length > maxChars) continue;
+    picked.push(chunk);
+    used += chunk.text.length + 5;
+  }
+
+  return picked
+    .sort((a, b) => a.index - b.index)
+    .map((chunk) => chunk.text)
+    .join("\n[...]\n");
+}
 
 // Extract text from uploaded file
 async function extractTextFromFile(buffer, filename) {
@@ -159,6 +246,13 @@ function extractKeyElements(text) {
   if (sections)
     elements.push({ type: "sections", values: sections.slice(0, 3) });
 
+  // Numbered clause headings at the start of a line, e.g. "2. Notice period:"
+  const clauses = [
+    ...text.matchAll(/^\s*(\d+(?:\.\d+)*)[.)]\s+([A-Z][A-Za-z ]{1,40}?)\s*:/gm),
+  ].map(([, number, heading]) => `${number}. ${heading.trim()}`);
+  if (clauses.length)
+    elements.push({ type: "clauses", values: clauses.slice(0, 3) });
+
   return elements;
 }
 
@@ -194,6 +288,14 @@ async function processUploadedDocument({
 
     analysis.ukLegalRelevance = relevanceCheck;
 
+    // Long documents: embed their chunks so questions can find the right sections
+    let chunks = [];
+    try {
+      chunks = await embedDocumentChunks(text);
+    } catch (embedError) {
+      console.warn(`Could not embed ${filename}; long questions will use its start:`, embedError.message);
+    }
+
     // Save to database
     const document = new UploadedDocument({
       sessionId,
@@ -205,6 +307,7 @@ async function processUploadedDocument({
       fileType: filename.split(".").pop().toLowerCase(),
       fileSize: buffer.length,
       documentType: analysis.documentType,
+      chunks,
       metadata: {
         ...extractionMetadata,
         ...analysis,
@@ -233,11 +336,15 @@ async function processUploadedDocument({
 // Get all documents for a session
 async function getSessionDocuments(sessionId, userId) {
   try {
+    // lean(): plain objects, so chunks can be copied with spread (Mongoose
+    // sub-documents keep their fields behind getters that spread does not copy)
     const documents = await UploadedDocument.find({
       sessionId,
       userId,
       isActive: true,
-    }).sort({ createdAt: -1 });
+    })
+      .sort({ createdAt: -1 })
+      .lean();
 
     return documents.map((doc) => ({
       id: doc._id,
@@ -247,6 +354,7 @@ async function getSessionDocuments(sessionId, userId) {
       wordCount: doc.metadata?.wordCount || 0,
       uploadedAt: doc.createdAt,
       extractedText: doc.extractedText,
+      chunks: doc.chunks || [],
     }));
   } catch (error) {
     console.error("Error fetching session documents:", error);
@@ -279,6 +387,7 @@ async function createDocumentContext(documents, userQuery, maxTokens = 6000) {
 
   // Add detailed content from most relevant documents
   let usedTokens = 0;
+  let queryVector = null; // embedded only if a long document needs it
   const detailedContent = [];
 
   for (const doc of relevantDocs) {
@@ -289,8 +398,19 @@ async function createDocumentContext(documents, userQuery, maxTokens = 6000) {
         `CONTENT FROM ${doc.filename.toUpperCase()}:\n${doc.extractedText}`
       );
       usedTokens += docTokens;
+    } else if (doc.chunks?.length) {
+      // Too long to send whole: send the sections closest in meaning to the question
+      const availableChars = (remainingTokens - usedTokens) * 4 - 100;
+      queryVector = queryVector || (await embeddings.embedQuery(userQuery));
+      const sections = pickRelevantChunks(doc.chunks, queryVector, availableChars);
+      if (sections) {
+        detailedContent.push(
+          `CONTENT FROM ${doc.filename.toUpperCase()} (most relevant sections):\n${sections}`
+        );
+      }
+      break;
     } else {
-      // Include partial content if space allows
+      // Older uploads without chunks: include the start of the document if space allows
       const availableChars = (remainingTokens - usedTokens) * 4 - 100;
       if (availableChars > 200) {
         const partialContent =
@@ -312,18 +432,25 @@ async function createDocumentContext(documents, userQuery, maxTokens = 6000) {
   return context;
 }
 
-// Find documents most relevant to user query
-function findRelevantDocuments(documents, userQuery) {
-  const queryWords = userQuery
+// Lowercase words longer than 3 letters, punctuation removed ("service?" -> "service")
+function queryWords(text) {
+  return text
     .toLowerCase()
+    .replace(/[-/]/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
     .split(/\s+/)
     .filter((word) => word.length > 3);
+}
+
+// Find documents most relevant to user query
+function findRelevantDocuments(documents, userQuery) {
+  const words = queryWords(userQuery);
 
   // Score documents based on keyword overlap
   const scored = documents.map((doc) => {
     const docText = (doc.extractedText + " " + doc.summary).toLowerCase();
-    const matchingWords = queryWords.filter((word) => docText.includes(word));
-    const score = matchingWords.length / Math.max(queryWords.length, 1);
+    const matchingWords = words.filter((word) => docText.includes(word));
+    const score = matchingWords.length / Math.max(words.length, 1);
 
     // Boost score for employment contracts and agreements
     if (
@@ -369,14 +496,14 @@ function isQueryAboutDocuments(query, documents) {
   }
 
   // Check for content overlap
-  const queryWords = queryLower.split(/\s+/).filter((word) => word.length > 3);
+  const words = queryWords(query);
   const allDocText = documents
     .map((d) => d.summary + " " + d.extractedText.substring(0, 500))
     .join(" ")
     .toLowerCase();
 
-  const matchingWords = queryWords.filter((word) => allDocText.includes(word));
-  return matchingWords.length / Math.max(queryWords.length, 1) > 0.3;
+  const matchingWords = words.filter((word) => allDocText.includes(word));
+  return matchingWords.length / Math.max(words.length, 1) > 0.3;
 }
 function isUKLegalDocument(text, filename) {
   const textLower = text.toLowerCase();
@@ -945,4 +1072,9 @@ module.exports = {
   extractTextFromFile,
   isUKLegalDocument,
   findRelevantDocuments,
+  extractKeyElements,
+  queryWords,
+  splitIntoChunks,
+  embedDocumentChunks,
+  WHOLE_DOCUMENT_CHARS,
 };

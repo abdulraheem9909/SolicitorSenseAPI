@@ -43,6 +43,15 @@ const uploadedDocumentSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: {}
   },
+  // Only for long documents: their text in ~1,000-character chunks with embeddings,
+  // so questions can retrieve the relevant sections. Deleted with the document.
+  chunks: [
+    {
+      _id: false,
+      text: { type: String, required: true },
+      embedding: { type: [Number], required: true },
+    },
+  ],
   isActive: {
     type: Boolean,
     default: true

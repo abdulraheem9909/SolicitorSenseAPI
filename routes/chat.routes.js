@@ -1,6 +1,7 @@
 // routes/chat.routes.js (MODIFIED - added file upload support)
 const express = require("express");
 const Message = require("../models/chat");
+const UploadedDocument = require("../models/uploadDocument");
 const { v4: uuidv4 } = require("uuid");
 const { HumanMessage, AIMessage } = require("@langchain/core/messages");
 const authenticateToken = require("../middlewares/authMiddleware");
@@ -269,7 +270,8 @@ router.post(
         technicalErrors: processedDocuments.filter(
           (d) => !d.processed && !d.irrelevant
         ).length,
-        documentContext: response.documentContext || hasValidDocuments,
+        documentContext: response.documentContext === true, // the answer used the documents
+        sessionHasDocuments: response.sessionHasDocuments === true,
         documentsAvailable: response.documentsAvailable || 0,
         uploadResults:
           uploadedFiles.length > 0 ? processedDocuments : undefined,
@@ -319,7 +321,6 @@ router.delete("/documents/:documentId", authenticateToken, async (req, res) => {
     const { documentId } = req.params;
     const userId = req.user?.id;
 
-    const UploadedDocument = require("../models/uploadDocument");
     const document = await UploadedDocument.findOneAndUpdate(
       { _id: documentId, userId },
       { isActive: false },
@@ -415,16 +416,55 @@ router.get("/:id", authenticateToken, async (req, res) => {
   }
 });
 
+// Delete a whole chat: all of the caller's messages and uploaded documents in it
+router.delete("/session/:sessionId", authenticateToken, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const userId = req.user?.id;
+
+    const [messages, documents] = await Promise.all([
+      Message.deleteMany({ sessionId, userId }),
+      UploadedDocument.deleteMany({ sessionId, userId }),
+    ]);
+
+    if (messages.deletedCount === 0 && documents.deletedCount === 0) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    res.status(200).json({
+      success: true,
+      deletedMessages: messages.deletedCount,
+      deletedDocuments: documents.deletedCount,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A question and its answer are saved together, so they are deleted together
 router.delete("/:id", authenticateToken, async (req, res) => {
   try {
-    const deletedMessage = await Message.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.user?.id,
-    });
-    if (!deletedMessage) {
+    const userId = req.user?.id;
+    const message = await Message.findOne({ _id: req.params.id, userId });
+    if (!message) {
       return res.status(404).json({ error: "Message not found" });
     }
-    res.status(200).json({ message: "Message deleted successfully" });
+
+    const sameChat = {
+      sessionId: message.sessionId,
+      userId,
+      _id: { $ne: message._id },
+    };
+    const partner =
+      message.type === "Human"
+        ? await Message.findOne({ ...sameChat, createdAt: { $gte: message.createdAt } }).sort({ createdAt: 1 })
+        : await Message.findOne({ ...sameChat, createdAt: { $lte: message.createdAt } }).sort({ createdAt: -1 });
+
+    const ids = [message._id];
+    if (partner && partner.type !== message.type) ids.push(partner._id);
+
+    const { deletedCount } = await Message.deleteMany({ _id: { $in: ids }, userId });
+    res.status(200).json({ message: "Message deleted successfully", deletedCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
